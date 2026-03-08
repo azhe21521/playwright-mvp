@@ -1,6 +1,16 @@
 /**
  * Playwright MVP CDP Bridge Server
- * 提供标准 CDP HTTP/WebSocket 端点，将请求转发到 Chrome Extension
+ * 
+ * 架构：
+ *   Playwright MCP  <--CDP-->  CDPBridge  <--自定义协议-->  Chrome Extension
+ * 
+ * 端点：
+ *   /cdp        - Playwright MCP 连接（标准 CDP 协议）
+ *   /extension  - Chrome Extension 连接（自定义扩展协议）
+ * 
+ * 多标签支持：
+ *   Bridge 可以同时管理多个标签页。每个标签页有独立的 CDP Session。
+ *   Playwright 通过 Target.setAutoAttach 附加到标签页。
  */
 import express, { type Express } from 'express';
 import { createServer, type Server } from 'http';
@@ -10,6 +20,28 @@ import { createLogger } from '@playwright-mvp/shared';
 import { config, validateConfig } from './config.js';
 
 const logger = createLogger('CDPBridge', config.logLevel);
+
+// ==================== 类型定义 ====================
+
+interface TabSession {
+  tabId: number;
+  sessionId: string;
+  targetInfo: any;
+}
+
+interface ExtensionCommand {
+  id: number;
+  method: string;
+  params?: any;
+}
+
+interface ExtensionResponse {
+  id?: number;
+  method?: string;
+  params?: any;
+  result?: any;
+  error?: string;
+}
 
 // ==================== 状态管理 ====================
 
@@ -22,33 +54,33 @@ let extensionWs: WebSocket | null = null;
 /** 等待认证的 Extension 连接 */
 let pendingExtensionWs: WebSocket | null = null;
 
-/** MCP/CDP 客户端连接列表 */
-const cdpClients = new Map<string, WebSocket>();
-
-/** 等待响应的请求 */
-const pendingRequests = new Map<number, {
-  clientId: string;
-  resolve: (result: unknown) => void;
-  reject: (error: Error) => void;
-  timeout: NodeJS.Timeout;
-}>();
-
-/** 请求 ID 计数器 */
-let requestIdCounter = 0;
+/** Playwright MCP 客户端连接 */
+let playwrightWs: WebSocket | null = null;
 
 /** 服务启动时间 */
 const startTime = Date.now();
 
-/** 获取 Target 列表（从 Extension 获取） */
-let cachedTargets: Target[] = [];
+// 多标签 Session 管理
+/** sessionId -> TabSession */
+const sessions = new Map<string, TabSession>();
+/** tabId -> sessionId */
+const tabToSession = new Map<number, string>();
+/** 子 CDP sessionId -> tabId */
+const childSessionToTab = new Map<string, number>();
+/** 下一个 Session ID */
+let nextSessionId = 1;
 
-interface Target {
-  id: string;
-  type: 'page';
-  title: string;
-  url: string;
-  webSocketDebuggerUrl: string;
-}
+/** Auto-attach 状态 */
+let autoAttachEnabled = false;
+
+// Extension 命令回调管理
+let extensionCommandId = 0;
+const extensionCallbacks = new Map<number, {
+  resolve: (result: any) => void;
+  reject: (error: Error) => void;
+  method: string;
+  timeout: NodeJS.Timeout;
+}>();
 
 // ==================== CDP HTTP 端点 ====================
 
@@ -76,7 +108,13 @@ app.get('/json/version', (req, res) => {
 app.get(['/json/list', '/json'], async (req, res) => {
   logger.info(`收到 /json/list 请求`);
   try {
-    const targets = await getTargetList(req.headers.host as string);
+    const targets = Array.from(sessions.values()).map(s => ({
+      id: s.targetInfo?.targetId || String(s.tabId),
+      type: 'page',
+      title: s.targetInfo?.title || '',
+      url: s.targetInfo?.url || '',
+      webSocketDebuggerUrl: `ws://${req.headers.host}/devtools/page/${s.sessionId}`,
+    }));
     logger.info(`返回 targets: ${JSON.stringify(targets)}`);
     res.json(targets);
   } catch (error) {
@@ -93,54 +131,6 @@ app.get('/json/protocol', (req, res) => {
 });
 
 /**
- * PUT /json/new - 打开新标签页
- */
-app.put('/json/new', async (req, res) => {
-  const url = req.query.url as string || 'about:blank';
-  try {
-    const result = await sendToExtension({
-      action: 'newTab',
-      url,
-    });
-    const target = result as Target;
-    target.webSocketDebuggerUrl = `ws://${req.headers.host}/devtools/page/${target.id}`;
-    res.json(target);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create new tab' });
-  }
-});
-
-/**
- * GET /json/activate/:targetId - 激活页面
- */
-app.get('/json/activate/:targetId', async (req, res) => {
-  try {
-    await sendToExtension({
-      action: 'activateTab',
-      targetId: req.params.targetId,
-    });
-    res.send('Target activated');
-  } catch (error) {
-    res.status(404).send(`No such target id: ${req.params.targetId}`);
-  }
-});
-
-/**
- * GET /json/close/:targetId - 关闭页面
- */
-app.get('/json/close/:targetId', async (req, res) => {
-  try {
-    await sendToExtension({
-      action: 'closeTab',
-      targetId: req.params.targetId,
-    });
-    res.send('Target is closing');
-  } catch (error) {
-    res.status(404).send(`No such target id: ${req.params.targetId}`);
-  }
-});
-
-/**
  * GET /health - 健康检查
  */
 app.get('/health', (req, res) => {
@@ -149,114 +139,304 @@ app.get('/health', (req, res) => {
     version: config.version,
     uptime: Math.floor((Date.now() - startTime) / 1000),
     extensionConnected: !!extensionWs,
-    cdpClients: cdpClients.size,
+    playwrightConnected: !!playwrightWs,
+    activeSessions: sessions.size,
   });
 });
 
-// ==================== 辅助函数 ====================
+// ==================== Extension 通信 ====================
 
 /**
- * 获取 Target 列表
+ * 发送命令到 Extension 并等待响应
  */
-async function getTargetList(host: string): Promise<Target[]> {
-  logger.info(`getTargetList 被调用, extensionWs=${!!extensionWs}, readyState=${extensionWs?.readyState}`);
-  
-  if (!extensionWs) {
-    logger.warn('Extension 未连接，返回空列表');
-    return [];
-  }
-
-  try {
-    logger.info('向 Extension 发送 listTargets 请求...');
-    const result = await sendToExtension({ action: 'listTargets' });
-    logger.info(`Extension 返回结果: ${JSON.stringify(result)}`);
-    const tabs = result as Array<{ id: string; title: string; url: string }>;
-    
-    cachedTargets = tabs.map(tab => ({
-      id: tab.id,
-      type: 'page' as const,
-      title: tab.title,
-      url: tab.url,
-      webSocketDebuggerUrl: `ws://${host}/devtools/page/${tab.id}`,
-    }));
-    
-    return cachedTargets;
-  } catch (error) {
-    logger.error('获取 Target 列表失败:', error);
-    return cachedTargets;
-  }
-}
-
-/**
- * 发送消息到 Extension 并等待响应
- */
-function sendToExtension(message: object): Promise<unknown> {
+function sendToExtension(method: string, params: any = {}): Promise<any> {
   return new Promise((resolve, reject) => {
     if (!extensionWs || extensionWs.readyState !== WebSocket.OPEN) {
       reject(new Error('Extension not connected'));
       return;
     }
 
-    const id = ++requestIdCounter;
+    const id = ++extensionCommandId;
     const timeout = setTimeout(() => {
-      pendingRequests.delete(id);
-      reject(new Error('Request timeout'));
+      extensionCallbacks.delete(id);
+      reject(new Error(`Extension command timeout: ${method}`));
     }, 30000);
 
-    pendingRequests.set(id, {
-      clientId: '__internal__',
+    extensionCallbacks.set(id, {
       resolve,
       reject,
+      method,
       timeout,
     });
 
-    extensionWs.send(JSON.stringify({ id, ...message }));
+    const message: ExtensionCommand = { id, method, params };
+    logger.debug(`→ Extension: ${method} (id=${id})`);
+    extensionWs.send(JSON.stringify(message));
+  });
+}
+
+/**
+ * 附加到标签页
+ */
+async function attachToTab(tabId: number): Promise<void> {
+  if (tabToSession.has(tabId)) {
+    logger.debug(`Tab ${tabId} 已附加，跳过`);
+    return;
+  }
+
+  if (!extensionWs) {
+    throw new Error('Extension not connected');
+  }
+
+  try {
+    const { targetInfo } = await sendToExtension('attachToTab', { tabId });
+    const sessionId = `pw-tab-${nextSessionId++}`;
+
+    const session: TabSession = { tabId, sessionId, targetInfo };
+    sessions.set(sessionId, session);
+    tabToSession.set(tabId, sessionId);
+
+    logger.info(`已附加到 Tab ${tabId}, sessionId=${sessionId}`);
+
+    // 通知 Playwright 新的 target
+    sendToPlaywright({
+      method: 'Target.attachedToTarget',
+      params: {
+        sessionId,
+        targetInfo: {
+          ...targetInfo,
+          attached: true,
+        },
+        waitingForDebugger: false,
+      },
+    });
+  } catch (e: any) {
+    logger.error(`附加到 Tab ${tabId} 失败: ${e.message}`);
+  }
+}
+
+/**
+ * 从标签页分离
+ */
+async function detachFromTab(tabId: number): Promise<void> {
+  const sessionId = tabToSession.get(tabId);
+  if (!sessionId) return;
+
+  const session = sessions.get(sessionId);
+  if (!session) return;
+
+  sessions.delete(sessionId);
+  tabToSession.delete(tabId);
+  
+  // 清理子 session
+  for (const [childSessionId, childTabId] of childSessionToTab) {
+    if (childTabId === tabId) {
+      childSessionToTab.delete(childSessionId);
+    }
+  }
+
+  if (extensionWs) {
+    try {
+      await sendToExtension('detachFromTab', { tabId });
+    } catch (e: any) {
+      logger.debug(`分离 Tab ${tabId} 出错: ${e.message}`);
+    }
+  }
+
+  sendToPlaywright({
+    method: 'Target.detachedFromTarget',
+    params: { sessionId },
   });
 }
 
 /**
  * 转发 CDP 命令到 Extension
  */
-function forwardCdpToExtension(clientId: string, targetId: string, message: object): void {
-  logger.info(`转发 CDP 命令: clientId=${clientId}, targetId=${targetId}, message=${JSON.stringify(message)}`);
-  
-  if (!extensionWs || extensionWs.readyState !== WebSocket.OPEN) {
-    logger.warn(`Extension 未连接或连接已关闭: ws=${!!extensionWs}, readyState=${extensionWs?.readyState}`);
-    const cdpClient = cdpClients.get(clientId);
-    if (cdpClient) {
-      const msg = message as { id?: number };
-      cdpClient.send(JSON.stringify({
-        id: msg.id,
-        error: { code: -32000, message: 'Extension not connected' },
-      }));
-    }
-    return;
+async function forwardToExtension(method: string, params: any, sessionId: string | undefined): Promise<any> {
+  if (!extensionWs) {
+    throw new Error('Extension not connected');
   }
 
-  // 为请求添加路由信息
-  const forwardMessage = {
-    ...(message as object),
-    __clientId: clientId,
-    __targetId: targetId,
-  };
-
-  const messageStr = JSON.stringify(forwardMessage);
-  logger.info(`发送到 Extension: ${messageStr}`);
-  logger.info(`Extension WebSocket 状态: readyState=${extensionWs.readyState}, bufferedAmount=${extensionWs.bufferedAmount}`);
+  // 从 sessionId 解析 tabId
+  let tabId: number | undefined;
+  let actualSessionId: string | undefined;
   
-  extensionWs.send(messageStr, (err) => {
-    if (err) {
-      logger.error(`发送到 Extension 失败: ${err.message}`);
+  if (sessionId) {
+    const session = sessions.get(sessionId);
+    if (session) {
+      tabId = session.tabId;
+      // 顶层 sessionId 仅在 bridge 和 Playwright 之间使用
+      actualSessionId = undefined;
     } else {
-      logger.info(`发送到 Extension 成功`);
+      // 可能是子 session
+      tabId = childSessionToTab.get(sessionId);
+      if (tabId !== undefined) {
+        actualSessionId = sessionId;
+      } else {
+        throw new Error(`Unknown CDP sessionId: ${sessionId}`);
+      }
     }
+  }
+
+  if (tabId === undefined) {
+    // 浏览器级别命令：使用第一个可用的已附加标签页
+    const firstSession = sessions.values().next().value;
+    if (firstSession) {
+      tabId = firstSession.tabId;
+    }
+  }
+
+  if (tabId === undefined) {
+    throw new Error('No tab connected');
+  }
+
+  return await sendToExtension('forwardCDPCommand', {
+    tabId,
+    sessionId: actualSessionId,
+    method,
+    params,
   });
+}
+
+// ==================== Playwright 通信 ====================
+
+/**
+ * 发送消息到 Playwright
+ */
+function sendToPlaywright(message: any): void {
+  if (playwrightWs?.readyState === WebSocket.OPEN) {
+    logger.debug(`→ Playwright: ${message.method ?? `response(id=${message.id})`}`);
+    playwrightWs.send(JSON.stringify(message));
+  }
+}
+
+/**
+ * 处理 CDP 命令
+ */
+async function handleCDPCommand(id: number, method: string, params: any, sessionId: string | undefined): Promise<void> {
+  logger.debug(`← Playwright: ${method} (id=${id}, sessionId=${sessionId})`);
+
+  try {
+    let result: any;
+
+    switch (method) {
+      case 'Browser.getVersion':
+        result = {
+          protocolVersion: '1.3',
+          product: 'Chrome/Extension-Bridge',
+          userAgent: 'CDP-Bridge-Server/1.0.0',
+        };
+        break;
+
+      case 'Browser.setDownloadBehavior':
+        result = {};
+        break;
+
+      case 'Target.setAutoAttach': {
+        // 对于子 session（sessionId 存在），转发到 extension
+        if (sessionId) {
+          result = await forwardToExtension(method, params, sessionId);
+          break;
+        }
+
+        if (!extensionWs) {
+          logger.info('等待 Extension 连接...');
+          throw new Error('Extension not connected');
+        }
+
+        autoAttachEnabled = true;
+
+        // 从 Extension 获取所有可用标签页并自动附加
+        const tabsResult = await sendToExtension('listTabs', {});
+        const tabs: Array<{ id: number; title: string; url: string }> = tabsResult?.tabs || [];
+
+        logger.info(`Auto-attaching to ${tabs.length} tabs`);
+
+        for (const tab of tabs) {
+          await attachToTab(tab.id);
+        }
+
+        result = {};
+        break;
+      }
+
+      case 'Target.getTargets': {
+        // 返回所有当前已附加的 targets
+        const targets = Array.from(sessions.values()).map(s => ({
+          ...s.targetInfo,
+          attached: true,
+        }));
+        result = { targetInfos: targets };
+        break;
+      }
+
+      case 'Target.getTargetInfo': {
+        if (sessionId) {
+          const session = sessions.get(sessionId);
+          if (session) {
+            result = { targetInfo: session.targetInfo };
+            break;
+          }
+        }
+        // 如果没有指定 session，返回第一个 target
+        const first = sessions.values().next().value;
+        result = first ? { targetInfo: first.targetInfo } : {};
+        break;
+      }
+
+      case 'Target.detachFromTarget': {
+        const targetSessionId = params?.sessionId;
+        if (targetSessionId) {
+          const session = sessions.get(targetSessionId);
+          if (session) {
+            await detachFromTab(session.tabId);
+          }
+        }
+        result = {};
+        break;
+      }
+
+      case 'Target.closeTarget': {
+        const targetId = params?.targetId;
+        if (targetId) {
+          const session = Array.from(sessions.values()).find(
+            s => s.targetInfo?.targetId === targetId
+          );
+          if (session) {
+            await sendToExtension('closeTab', { tabId: session.tabId });
+            result = { success: true };
+            break;
+          }
+        }
+        result = await forwardToExtension(method, params, sessionId);
+        break;
+      }
+
+      default:
+        // 转发到 Extension
+        result = await forwardToExtension(method, params, sessionId);
+        break;
+    }
+
+    sendToPlaywright({ id, sessionId, result });
+  } catch (e: any) {
+    const isKnownLimitation = /session.*not found|no frame for given id/i.test(e.message);
+    if (isKnownLimitation) {
+      logger.warn(`CDP 命令 ${method} (已知限制): ${e.message}`);
+    } else {
+      logger.error(`CDP 命令 ${method} 处理失败: ${e.message}`);
+    }
+    sendToPlaywright({
+      id,
+      sessionId,
+      error: { message: e.message },
+    });
+  }
 }
 
 // ==================== WebSocket 服务器 ====================
 
 const server = createServer(app);
-
 const wss = new WebSocketServer({ noServer: true });
 
 /**
@@ -277,12 +457,11 @@ server.on('upgrade', (request, socket, head) => {
   }
 
   // CDP 客户端连接端点
-  if (pathname.startsWith('/devtools/browser/') || pathname.startsWith('/devtools/page/') || pathname === '/cdp') {
+  if (pathname.startsWith('/devtools/browser/') || 
+      pathname.startsWith('/devtools/page/') || 
+      pathname === '/cdp') {
     wss.handleUpgrade(request, socket, head, (ws) => {
-      const targetId = pathname.startsWith('/devtools/page/') 
-        ? pathname.replace('/devtools/page/', '')
-        : 'browser';
-      handleCdpClientConnection(ws, targetId);
+      handlePlaywrightConnection(ws);
     });
     return;
   }
@@ -343,9 +522,11 @@ function handleExtensionConnection(ws: WebSocket): void {
  */
 function setupExtensionHandlers(ws: WebSocket): void {
   ws.on('message', (data) => {
-    logger.info(`收到 Extension 消息: ${data.toString().substring(0, 200)}`);
+    const raw = data.toString();
+    logger.debug(`← Extension: ${raw.substring(0, 200)}`);
+    
     try {
-      const message = JSON.parse(data.toString());
+      const message: ExtensionResponse = JSON.parse(raw);
       handleExtensionMessage(message);
     } catch (error) {
       logger.error('Extension 消息解析失败:', error);
@@ -356,9 +537,15 @@ function setupExtensionHandlers(ws: WebSocket): void {
     logger.info(`Extension 断开连接: code=${code}, reason=${reason?.toString() || 'none'}`);
     extensionWs = null;
     
-    // 通知所有 CDP 客户端
-    for (const [clientId, client] of cdpClients) {
-      client.close(4000, 'Extension disconnected');
+    // 清理所有 session
+    sessions.clear();
+    tabToSession.clear();
+    childSessionToTab.clear();
+    autoAttachEnabled = false;
+    
+    // 通知 Playwright 断开
+    if (playwrightWs?.readyState === WebSocket.OPEN) {
+      playwrightWs.close(4000, 'Extension disconnected');
     }
   });
 
@@ -367,14 +554,9 @@ function setupExtensionHandlers(ws: WebSocket): void {
   });
 
   // 设置 ping-pong 保活
-  ws.on('pong', () => {
-    logger.debug('收到 Extension pong');
-  });
-
   const pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.ping();
-      logger.debug('发送 ping 到 Extension');
     } else {
       clearInterval(pingInterval);
     }
@@ -388,91 +570,115 @@ function setupExtensionHandlers(ws: WebSocket): void {
 /**
  * 处理来自 Extension 的消息
  */
-function handleExtensionMessage(message: Record<string, unknown>): void {
-  const id = message.id as number | undefined;
-  const clientId = message.__clientId as string | undefined;
+function handleExtensionMessage(message: ExtensionResponse): void {
+  // 响应消息（有 id）
+  if (message.id && extensionCallbacks.has(message.id)) {
+    const callback = extensionCallbacks.get(message.id)!;
+    extensionCallbacks.delete(message.id);
+    clearTimeout(callback.timeout);
 
-  // 内部请求的响应
-  if (id && !clientId) {
-    const pending = pendingRequests.get(id);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      pendingRequests.delete(id);
-      
-      if (message.error) {
-        pending.reject(new Error((message.error as { message: string }).message));
-      } else {
-        pending.resolve(message.result);
-      }
-    }
-    return;
-  }
-
-  // CDP 客户端请求的响应
-  if (clientId && clientId !== '__internal__') {
-    const cdpClient = cdpClients.get(clientId);
-    if (cdpClient && cdpClient.readyState === WebSocket.OPEN) {
-      // 清除路由信息
-      const cleanMessage = { ...message };
-      delete cleanMessage.__clientId;
-      delete cleanMessage.__targetId;
-      
-      const msgStr = JSON.stringify(cleanMessage);
-      logger.info(`转发响应到 CDP 客户端 [${clientId}]: ${msgStr.substring(0, 150)}`);
-      cdpClient.send(msgStr);
+    if (message.error) {
+      callback.reject(new Error(message.error));
     } else {
-      logger.warn(`CDP 客户端 [${clientId}] 不存在或已断开`);
+      logger.debug(`← Extension: ${callback.method} 响应 (id=${message.id})`);
+      callback.resolve(message.result);
     }
     return;
   }
 
-  // CDP 事件（广播给所有客户端）
-  if (message.method && !id) {
-    const targetId = message.__targetId as string | undefined;
-    
-    // 清除路由信息
-    const cleanMessage = { ...message };
-    delete cleanMessage.__clientId;
-    delete cleanMessage.__targetId;
-    
-    const eventData = JSON.stringify(cleanMessage);
-    
-    // 广播给对应的客户端
-    for (const [cid, client] of cdpClients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(eventData);
+  // 事件消息（无 id，有 method）
+  if (message.method) {
+    handleExtensionEvent(message.method, message.params);
+  }
+}
+
+/**
+ * 处理 Extension 事件
+ */
+function handleExtensionEvent(method: string, params: any): void {
+  switch (method) {
+    case 'forwardCDPEvent': {
+      const tabId = params.tabId;
+      const sessionId = tabToSession.get(tabId);
+      const childSessionId = params.sessionId as string | undefined;
+      
+      if (childSessionId) {
+        childSessionToTab.set(childSessionId, tabId);
       }
+      
+      const eventSessionId = childSessionId || sessionId;
+      sendToPlaywright({
+        sessionId: eventSessionId,
+        method: params.method,
+        params: params.params,
+      });
+      break;
+    }
+
+    case 'tabDetached': {
+      const { tabId, reason } = params;
+      logger.info(`Tab ${tabId} 已分离: ${reason}`);
+      
+      const sessionId = tabToSession.get(tabId);
+      if (sessionId) {
+        sessions.delete(sessionId);
+        tabToSession.delete(tabId);
+        
+        // 清理子 session
+        for (const [childSessionId, childTabId] of childSessionToTab) {
+          if (childTabId === tabId) {
+            childSessionToTab.delete(childSessionId);
+          }
+        }
+        
+        sendToPlaywright({
+          method: 'Target.detachedFromTarget',
+          params: { sessionId },
+        });
+      }
+      break;
     }
   }
 }
 
 /**
- * 处理 CDP 客户端连接
+ * 处理 Playwright 连接
  */
-function handleCdpClientConnection(ws: WebSocket, targetId: string): void {
-  const clientId = randomUUID();
-  cdpClients.set(clientId, ws);
+function handlePlaywrightConnection(ws: WebSocket): void {
+  if (playwrightWs) {
+    logger.warn('拒绝第二个 Playwright 连接');
+    ws.close(1000, 'Another CDP client already connected');
+    return;
+  }
   
-  logger.info(`CDP 客户端已连接: ${clientId}, target: ${targetId}, readyState: ${ws.readyState}`);
+  playwrightWs = ws;
+  logger.info('✅ Playwright MCP 已连接');
 
   ws.on('message', (data) => {
-    logger.info(`收到 CDP 消息 [${clientId}]: ${data.toString().substring(0, 200)}`);
     try {
       const message = JSON.parse(data.toString());
-      logger.info(`CDP 请求 [${clientId}]: method=${message.method}, id=${message.id}`);
-      forwardCdpToExtension(clientId, targetId, message);
-    } catch (error) {
-      logger.error('CDP 消息解析失败:', error);
+      const { id, sessionId, method, params } = message;
+      handleCDPCommand(id, method, params, sessionId);
+    } catch (e: any) {
+      logger.error('Playwright 消息处理错误:', e.message);
     }
   });
 
-  ws.on('close', (code, reason) => {
-    logger.info(`CDP 客户端断开: ${clientId}, code=${code}, reason=${reason?.toString() || 'none'}`);
-    cdpClients.delete(clientId);
+  ws.on('close', () => {
+    if (playwrightWs !== ws) return;
+    playwrightWs = null;
+    
+    // 清理 session
+    sessions.clear();
+    tabToSession.clear();
+    childSessionToTab.clear();
+    autoAttachEnabled = false;
+    
+    logger.info('Playwright MCP 已断开');
   });
 
-  ws.on('error', (error) => {
-    logger.error(`CDP 客户端错误 [${clientId}]:`, error);
+  ws.on('error', (e) => {
+    logger.error('Playwright WebSocket 错误:', e.message);
   });
 }
 
@@ -497,10 +703,12 @@ server.listen(config.port, config.host, () => {
   logger.info('📋 HTTP 端点:');
   logger.info(`   GET  http://localhost:${config.port}/json/version`);
   logger.info(`   GET  http://localhost:${config.port}/json/list`);
+  logger.info(`   GET  http://localhost:${config.port}/health`);
   logger.info('');
   logger.info('🔌 WebSocket 端点:');
   logger.info(`   Extension: ws://localhost:${config.port}/extension`);
-  logger.info(`   CDP:       ws://localhost:${config.port}/devtools/browser/${browserId}`);
+  logger.info(`   CDP:       ws://localhost:${config.port}/cdp`);
+  logger.info(`   Browser:   ws://localhost:${config.port}/devtools/browser/${browserId}`);
   logger.info('');
   logger.info('💡 使用方式:');
   logger.info(`   Playwright MCP: --cdp-endpoint http://localhost:${config.port}`);
@@ -515,10 +723,16 @@ process.on('SIGTERM', () => {
   if (extensionWs) {
     extensionWs.close();
   }
-  for (const [, client] of cdpClients) {
-    client.close();
+  if (playwrightWs) {
+    playwrightWs.close();
   }
-  cdpClients.clear();
+  
+  // 清理回调
+  for (const [id, callback] of extensionCallbacks) {
+    clearTimeout(callback.timeout);
+    callback.reject(new Error('Server shutting down'));
+  }
+  extensionCallbacks.clear();
   
   server.close(() => {
     logger.info('服务器已关闭');

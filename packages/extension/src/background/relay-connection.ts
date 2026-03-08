@@ -1,13 +1,40 @@
 /**
  * CDP Bridge 连接管理
- * 管理与 CDP Bridge Server 的 WebSocket 连接
- * 直接转发标准 CDP 消息
+ * 
+ * 与 Bridge Server 使用自定义协议通信：
+ *   - attachToTab: 附加到标签页
+ *   - detachFromTab: 从标签页分离
+ *   - forwardCDPCommand: 转发 CDP 命令
+ *   - listTabs: 列出可用标签页
+ *   - closeTab: 关闭标签页
+ * 
+ * 事件：
+ *   - forwardCDPEvent: 转发 CDP 事件
+ *   - tabDetached: 标签页分离通知
  */
-console.log('[RelayConnection] 模块加载 - 版本 2026-03-08-v2');
+console.log('[RelayConnection] 模块加载 - 版本 2026-03-08-v3');
 
 import { type ConnectionState } from '@playwright-mvp/shared';
 import { getConfig, onConfigChange } from '../storage/config-storage.js';
 import { updateWhitelist, checkNavigationAllowed } from './whitelist.js';
+
+// ==================== 类型定义 ====================
+
+type ProtocolCommand = {
+  id: number;
+  method: string;
+  params?: any;
+};
+
+type ProtocolResponse = {
+  id?: number;
+  method?: string;
+  params?: any;
+  result?: any;
+  error?: string;
+};
+
+// ==================== 状态管理 ====================
 
 /** 连接状态 */
 let connectionState: ConnectionState = 'disconnected';
@@ -25,22 +52,18 @@ let reconnectAttempts = 0;
 type StateChangeCallback = (state: ConnectionState) => void;
 let stateChangeCallbacks: StateChangeCallback[] = [];
 
-/** 已附加的 Tab (tabId -> targetId) */
-const attachedTabs = new Map<number, string>();
+/** 已附加的 Tab (tabId -> targetInfo) */
+const attachedTabs = new Map<number, any>();
 
-/** targetId -> tabId 的映射 */
-const targetToTab = new Map<string, number>();
+/** Debugger 事件监听器 */
+let debuggerEventListener: ((source: chrome.debugger.Debuggee, method: string, params: any) => void) | null = null;
+let debuggerDetachListener: ((source: chrome.debugger.Debuggee, reason: string) => void) | null = null;
 
-/** 待处理的内部请求 */
-const pendingInternalRequests = new Map<number, {
-  resolve: (result: unknown) => void;
-  reject: (error: Error) => void;
-}>();
+// ==================== 辅助函数 ====================
 
-/** 内部请求 ID 计数器 */
-let internalRequestId = 0;
-
-// ==================== 状态管理 ====================
+function debugLog(...args: unknown[]): void {
+  console.log('[RelayConnection]', ...args);
+}
 
 /**
  * 获取当前连接状态
@@ -72,29 +95,159 @@ function setConnectionState(state: ConnectionState): void {
 /**
  * 发送消息到 Bridge Server
  */
-function sendMessage(message: unknown): void {
-  const msgStr = JSON.stringify(message);
-  console.log(`[RelayConnection] 发送消息: ${msgStr.substring(0, 200)}`);
+function sendMessage(message: ProtocolResponse): void {
   if (ws && ws.readyState === WebSocket.OPEN) {
+    const msgStr = JSON.stringify(message);
+    debugLog('发送消息:', msgStr.substring(0, 200));
     ws.send(msgStr);
-    console.log('[RelayConnection] 消息已发送');
   } else {
-    console.error(`[RelayConnection] WebSocket 未连接，无法发送消息: readyState=${ws?.readyState}`);
+    debugLog('WebSocket 未连接，无法发送消息');
   }
 }
 
-// ==================== CDP 执行相关 ====================
+// ==================== 协议命令处理 ====================
 
 /**
- * 通过 chrome.debugger 执行 CDP 命令
+ * 处理 attachToTab 命令
  */
-async function executeCdpCommand(
+async function handleAttachToTab(tabId: number): Promise<any> {
+  debugLog('附加到 Tab:', tabId);
+  
+  if (attachedTabs.has(tabId)) {
+    debugLog('Tab 已附加，返回缓存的 targetInfo');
+    return { targetInfo: attachedTabs.get(tabId) };
+  }
+
+  const debuggee: chrome.debugger.Debuggee = { tabId };
+  
+  // 附加 debugger
+  await new Promise<void>((resolve, reject) => {
+    chrome.debugger.attach(debuggee, '1.3', () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve();
+      }
+    });
+  });
+
+  // 获取 target 信息
+  const result = await new Promise<any>((resolve, reject) => {
+    chrome.debugger.sendCommand(debuggee, 'Target.getTargetInfo', undefined, (res) => {
+      if (chrome.runtime.lastError) {
+        // 某些情况下可能没有 targetInfo，构造一个
+        resolve(null);
+      } else {
+        resolve(res);
+      }
+    });
+  });
+
+  // 获取 Tab 信息作为备用
+  const tab = await chrome.tabs.get(tabId);
+  
+  const targetInfo = result?.targetInfo || {
+    targetId: String(tabId),
+    type: 'page',
+    title: tab.title || '',
+    url: tab.url || '',
+    attached: true,
+    browserContextId: '1',
+  };
+
+  attachedTabs.set(tabId, targetInfo);
+  debugLog('已附加到 Tab:', tabId, targetInfo);
+
+  return { targetInfo };
+}
+
+/**
+ * 处理 detachFromTab 命令
+ */
+async function handleDetachFromTab(tabId: number): Promise<any> {
+  debugLog('从 Tab 分离:', tabId);
+  
+  if (!attachedTabs.has(tabId)) {
+    return {};
+  }
+
+  await new Promise<void>((resolve) => {
+    chrome.debugger.detach({ tabId }, () => {
+      if (chrome.runtime.lastError) {
+        debugLog('分离警告:', chrome.runtime.lastError.message);
+      }
+      resolve();
+    });
+  });
+
+  attachedTabs.delete(tabId);
+  debugLog('已从 Tab 分离:', tabId);
+  
+  return {};
+}
+
+/**
+ * 处理 listTabs 命令
+ */
+async function handleListTabs(): Promise<any> {
+  const tabs = await chrome.tabs.query({});
+  
+  // 过滤掉 chrome:// 等内部页面
+  const filteredTabs = tabs.filter(tab =>
+    tab.url && !['chrome:', 'edge:', 'devtools:', 'chrome-extension:'].some(
+      scheme => tab.url!.startsWith(scheme)
+    )
+  );
+
+  return {
+    tabs: filteredTabs.map(tab => ({
+      id: tab.id!,
+      title: tab.title || 'Untitled',
+      url: tab.url!,
+      favIconUrl: tab.favIconUrl,
+      windowId: tab.windowId,
+    })),
+  };
+}
+
+/**
+ * 处理 closeTab 命令
+ */
+async function handleCloseTab(tabId: number): Promise<any> {
+  debugLog('关闭 Tab:', tabId);
+  await chrome.tabs.remove(tabId);
+  return { success: true };
+}
+
+/**
+ * 处理 forwardCDPCommand 命令
+ */
+async function handleForwardCDPCommand(
   tabId: number,
+  sessionId: string | undefined,
   method: string,
-  params?: Record<string, unknown>
-): Promise<unknown> {
+  params: any
+): Promise<any> {
+  debugLog('CDP 命令:', method, 'Tab:', tabId, 'sessionId:', sessionId);
+
+  if (!attachedTabs.has(tabId)) {
+    throw new Error(`Tab ${tabId} 未附加`);
+  }
+
+  // 特殊处理：导航命令需要检查白名单
+  if (method === 'Page.navigate' && params?.url) {
+    const check = checkNavigationAllowed(params.url as string);
+    if (!check.allowed) {
+      throw new Error(check.reason);
+    }
+  }
+
+  const debuggerSession: chrome.debugger.Debuggee = {
+    tabId,
+  };
+
   return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+    chrome.debugger.sendCommand(debuggerSession, method, params, (result) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else {
@@ -105,60 +258,35 @@ async function executeCdpCommand(
 }
 
 /**
- * 附加到 Tab
+ * 处理协议命令
  */
-async function attachToTab(tabId: number): Promise<string> {
-  if (attachedTabs.has(tabId)) {
-    return attachedTabs.get(tabId)!;
+async function handleCommand(message: ProtocolCommand): Promise<any> {
+  const { method, params } = message;
+
+  switch (method) {
+    case 'attachToTab':
+      return handleAttachToTab(params?.tabId);
+
+    case 'detachFromTab':
+      return handleDetachFromTab(params?.tabId);
+
+    case 'listTabs':
+      return handleListTabs();
+
+    case 'closeTab':
+      return handleCloseTab(params?.tabId);
+
+    case 'forwardCDPCommand':
+      return handleForwardCDPCommand(
+        params?.tabId,
+        params?.sessionId,
+        params?.method,
+        params?.params
+      );
+
+    default:
+      throw new Error(`未知命令: ${method}`);
   }
-
-  return new Promise((resolve, reject) => {
-    chrome.debugger.attach({ tabId }, '1.3', () => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-
-      // 使用 tabId 作为 targetId
-      const targetId = String(tabId);
-      attachedTabs.set(tabId, targetId);
-      targetToTab.set(targetId, tabId);
-
-      console.log('[CDP] 已附加到 Tab:', tabId, '-> targetId:', targetId);
-      resolve(targetId);
-    });
-  });
-}
-
-/**
- * 从 Tab 分离
- */
-async function detachFromTab(tabId: number): Promise<void> {
-  const targetId = attachedTabs.get(tabId);
-  if (!targetId) {
-    return;
-  }
-
-  return new Promise((resolve) => {
-    chrome.debugger.detach({ tabId }, () => {
-      if (chrome.runtime.lastError) {
-        console.warn('[CDP] 分离警告:', chrome.runtime.lastError.message);
-      }
-      
-      attachedTabs.delete(tabId);
-      targetToTab.delete(targetId);
-      console.log('[CDP] 已从 Tab 分离:', tabId);
-      resolve();
-    });
-  });
-}
-
-/**
- * 分离所有 Tab
- */
-async function detachAllTabs(): Promise<void> {
-  const tabIds = Array.from(attachedTabs.keys());
-  await Promise.all(tabIds.map((tabId) => detachFromTab(tabId)));
 }
 
 // ==================== 消息处理 ====================
@@ -167,363 +295,114 @@ async function detachAllTabs(): Promise<void> {
  * 处理来自 Bridge Server 的消息
  */
 async function handleMessage(data: string): Promise<void> {
-  console.log('[RelayConnection] 收到消息:', data.substring(0, 200));
+  let message: ProtocolCommand;
   
-  let message: Record<string, unknown>;
   try {
     message = JSON.parse(data);
-  } catch (e) {
-    console.error('[RelayConnection] JSON 解析错误:', e);
+  } catch (error: any) {
+    debugLog('JSON 解析错误:', error);
+    sendMessage({ error: `JSON 解析错误: ${error.message}` });
     return;
   }
 
-  const id = message.id as number | undefined;
-  const action = message.action as string | undefined;
-  const method = message.method as string | undefined;
-  const clientId = message.__clientId as string | undefined;
-  const targetId = message.__targetId as string | undefined;
+  debugLog('收到消息:', message);
 
-  console.log(`[RelayConnection] 解析消息: id=${id}, action=${action}, method=${method}, clientId=${clientId}, targetId=${targetId}`);
-
-  // 处理内部请求响应（如认证）
-  if (id && pendingInternalRequests.has(id)) {
-    console.log('[RelayConnection] 处理内部请求响应');
-    const pending = pendingInternalRequests.get(id)!;
-    pendingInternalRequests.delete(id);
-    
-    if (message.error) {
-      pending.reject(new Error((message.error as { message: string }).message));
-    } else {
-      pending.resolve(message.result);
-    }
-    return;
-  }
-
-  // 处理 Bridge Server 的控制命令
-  if (action) {
-    console.log('[RelayConnection] 处理控制命令:', action);
-    await handleControlAction(id, action, message);
-    return;
-  }
-
-  // 处理 CDP 命令（来自 MCP 客户端）
-  if (id && method) {
-    console.log('[RelayConnection] 处理 CDP 命令:', method);
-    await handleCdpCommand(id, message, clientId, targetId);
-    return;
-  }
-
-  console.warn('[RelayConnection] 未处理的消息:', message);
-}
-
-/**
- * 处理控制命令（如 listTargets、newTab 等）
- */
-async function handleControlAction(
-  id: number | undefined,
-  action: string,
-  message: Record<string, unknown>
-): Promise<void> {
-  try {
-    let result: unknown;
-
-    switch (action) {
-      case 'listTargets': {
-        const tabs = await chrome.tabs.query({});
-        result = tabs.map((tab) => ({
-          id: String(tab.id),
-          title: tab.title ?? '',
-          url: tab.url ?? '',
-        }));
-        break;
-      }
-
-      case 'newTab': {
-        const url = message.url as string || 'about:blank';
-        
-        // 检查白名单
-        if (url !== 'about:blank') {
-          const check = checkNavigationAllowed(url);
-          if (!check.allowed) {
-            throw new Error(check.reason);
-          }
-        }
-
-        const tab = await chrome.tabs.create({ url });
-        result = {
-          id: String(tab.id),
-          title: tab.title ?? '',
-          url: tab.url ?? url,
-        };
-        break;
-      }
-
-      case 'activateTab': {
-        const tabId = parseInt(message.targetId as string, 10);
-        await chrome.tabs.update(tabId, { active: true });
-        result = { success: true };
-        break;
-      }
-
-      case 'closeTab': {
-        const tabId = parseInt(message.targetId as string, 10);
-        await chrome.tabs.remove(tabId);
-        result = { success: true };
-        break;
-      }
-
-      default:
-        throw new Error(`Unknown action: ${action}`);
-    }
-
-    if (id) {
-      sendMessage({ id, result });
-    }
-  } catch (error) {
-    if (id) {
-      sendMessage({
-        id,
-        error: { code: -32603, message: error instanceof Error ? error.message : 'Internal error' },
-      });
-    }
-  }
-}
-
-/**
- * 处理 CDP 命令
- */
-async function handleCdpCommand(
-  id: number,
-  message: Record<string, unknown>,
-  clientId: string | undefined,
-  targetId: string | undefined
-): Promise<void> {
-  const method = message.method as string;
-  const params = message.params as Record<string, unknown> | undefined;
-
-  console.log(`[RelayConnection] 处理 CDP 命令: method=${method}, targetId=${targetId}`);
+  const response: ProtocolResponse = {
+    id: message.id,
+  };
 
   try {
-    // 处理浏览器级别的命令（不需要 Tab）
-    if (method.startsWith('Browser.') || method.startsWith('Target.')) {
-      const result = await handleBrowserLevelCommand(method, params);
-      sendMessage({
-        id,
-        result: result ?? {},
-        __clientId: clientId,
-        __targetId: targetId,
-      });
-      return;
-    }
+    response.result = await handleCommand(message);
+  } catch (error: any) {
+    debugLog('命令执行错误:', error);
+    response.error = error.message;
+  }
 
-    // 确定目标 Tab
-    let tabId: number;
+  debugLog('发送响应:', response);
+  sendMessage(response);
+}
+
+// ==================== Debugger 事件处理 ====================
+
+/**
+ * 设置 Debugger 事件监听
+ */
+function setupDebuggerListeners(): void {
+  // CDP 事件转发
+  debuggerEventListener = (source: chrome.debugger.Debuggee, method: string, params: any) => {
+    const tabId = source.tabId;
+    if (!tabId || !attachedTabs.has(tabId)) return;
+
+    debugLog('转发 CDP 事件:', method, 'Tab:', tabId);
     
-    if (targetId && targetId !== 'browser') {
-      tabId = parseInt(targetId, 10);
-    } else {
-      // 使用第一个已附加的 Tab，或者当前活跃 Tab
-      if (attachedTabs.size > 0) {
-        const firstKey = attachedTabs.keys().next().value;
-        if (firstKey === undefined) {
-          throw new Error('No attached tab');
-        }
-        tabId = firstKey;
-      } else {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!activeTab?.id) {
-          throw new Error('No active tab');
-        }
-        tabId = activeTab.id;
-      }
-    }
-
-    // 确保已附加到 Tab
-    if (!attachedTabs.has(tabId)) {
-      await attachToTab(tabId);
-    }
-
-    // 特殊处理：导航命令需要检查白名单
-    if (method === 'Page.navigate' && params?.url) {
-      const check = checkNavigationAllowed(params.url as string);
-      if (!check.allowed) {
-        throw new Error(check.reason);
-      }
-    }
-
-    // 执行 CDP 命令
-    const result = await executeCdpCommand(tabId, method, params);
-
-    // 发送响应
     sendMessage({
-      id,
-      result: result ?? {},
-      __clientId: clientId,
-      __targetId: targetId,
-    });
-  } catch (error) {
-    console.error(`[RelayConnection] CDP 命令执行失败: ${method}`, error);
-    sendMessage({
-      id,
-      error: {
-        code: -32603,
-        message: error instanceof Error ? error.message : 'CDP command failed',
+      method: 'forwardCDPEvent',
+      params: {
+        tabId,
+        sessionId: undefined, // chrome.debugger.Debuggee 没有 sessionId
+        method,
+        params,
       },
-      __clientId: clientId,
-      __targetId: targetId,
     });
+  };
+
+  // Debugger 分离事件
+  debuggerDetachListener = (source: chrome.debugger.Debuggee, reason: string) => {
+    const tabId = source.tabId;
+    if (!tabId || !attachedTabs.has(tabId)) return;
+
+    debugLog(`Debugger 从 Tab ${tabId} 分离: ${reason}`);
+    attachedTabs.delete(tabId);
+
+    sendMessage({
+      method: 'tabDetached',
+      params: {
+        tabId,
+        reason,
+      },
+    });
+  };
+
+  chrome.debugger.onEvent.addListener(debuggerEventListener);
+  chrome.debugger.onDetach.addListener(debuggerDetachListener);
+}
+
+/**
+ * 移除 Debugger 事件监听
+ */
+function removeDebuggerListeners(): void {
+  if (debuggerEventListener) {
+    chrome.debugger.onEvent.removeListener(debuggerEventListener);
+    debuggerEventListener = null;
+  }
+  if (debuggerDetachListener) {
+    chrome.debugger.onDetach.removeListener(debuggerDetachListener);
+    debuggerDetachListener = null;
   }
 }
 
 /**
- * 处理浏览器级别的 CDP 命令
- * Chrome 扩展的 debugger API 不支持浏览器级别命令，需要模拟实现
+ * 分离所有已附加的 Tab
  */
-async function handleBrowserLevelCommand(
-  method: string,
-  params?: Record<string, unknown>
-): Promise<unknown> {
-  console.log(`[RelayConnection] 处理浏览器级别命令: ${method}`);
+async function detachAllTabs(): Promise<void> {
+  const tabIds = Array.from(attachedTabs.keys());
   
-  switch (method) {
-    case 'Browser.getVersion':
-      return {
-        protocolVersion: '1.3',
-        product: 'Chrome/' + navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || 'Unknown',
-        revision: 'Unknown',
-        userAgent: navigator.userAgent,
-        jsVersion: 'Unknown',
-      };
-
-    case 'Browser.getWindowForTarget':
-      return {
-        windowId: 1,
-        bounds: { left: 0, top: 0, width: 1920, height: 1080, windowState: 'normal' },
-      };
-
-    case 'Target.getTargets':
-    case 'Target.getTargetInfo': {
-      const tabs = await chrome.tabs.query({});
-      const targets = tabs.map((tab) => ({
-        targetId: String(tab.id),
-        type: 'page',
-        title: tab.title ?? '',
-        url: tab.url ?? '',
-        attached: attachedTabs.has(tab.id!),
-        browserContextId: '1',
-      }));
-      return method === 'Target.getTargets' ? { targetInfos: targets } : { targetInfo: targets[0] };
+  for (const tabId of tabIds) {
+    try {
+      await new Promise<void>((resolve) => {
+        chrome.debugger.detach({ tabId }, () => {
+          if (chrome.runtime.lastError) {
+            debugLog('分离 Tab 警告:', tabId, chrome.runtime.lastError.message);
+          }
+          resolve();
+        });
+      });
+    } catch (e) {
+      debugLog('分离 Tab 错误:', tabId, e);
     }
-
-    case 'Target.createTarget': {
-      const url = (params?.url as string) || 'about:blank';
-      
-      // 检查白名单
-      if (url !== 'about:blank') {
-        const check = checkNavigationAllowed(url);
-        if (!check.allowed) {
-          throw new Error(check.reason);
-        }
-      }
-      
-      const tab = await chrome.tabs.create({ url });
-      const targetId = String(tab.id);
-      
-      // 自动附加到新创建的 Tab（模拟 autoAttach 行为）
-      try {
-        await attachToTab(tab.id!);
-        
-        // 发送 Target.attachedToTarget 事件（Playwright 期望这个事件）
-        // 使用 setTimeout 确保在响应之后发送
-        setTimeout(() => {
-          sendMessage({
-            method: 'Target.attachedToTarget',
-            params: {
-              sessionId: targetId,
-              targetInfo: {
-                targetId: targetId,
-                type: 'page',
-                title: tab.title || '',
-                url: tab.url || url,
-                attached: true,
-                browserContextId: '1',
-              },
-              waitingForDebugger: false,
-            },
-          });
-          console.log(`[RelayConnection] 发送 Target.attachedToTarget 事件: ${targetId}`);
-        }, 50);
-      } catch (e) {
-        console.warn(`[RelayConnection] 自动附加失败: ${e}`);
-      }
-      
-      return { targetId };
-    }
-
-    case 'Target.closeTarget': {
-      const targetId = params?.targetId as string;
-      if (targetId) {
-        await chrome.tabs.remove(parseInt(targetId, 10));
-      }
-      return { success: true };
-    }
-
-    case 'Target.activateTarget': {
-      const targetId = params?.targetId as string;
-      if (targetId) {
-        await chrome.tabs.update(parseInt(targetId, 10), { active: true });
-      }
-      return {};
-    }
-
-    case 'Target.attachToTarget': {
-      const targetId = params?.targetId as string;
-      if (targetId) {
-        const tabId = parseInt(targetId, 10);
-        await attachToTab(tabId);
-        return { sessionId: `session-${targetId}` };
-      }
-      throw new Error('Missing targetId');
-    }
-
-    case 'Target.detachFromTarget': {
-      const targetId = params?.targetId as string;
-      if (targetId) {
-        const tabId = parseInt(targetId, 10);
-        await detachFromTab(tabId);
-      }
-      return {};
-    }
-
-    case 'Target.setDiscoverTargets':
-      // 模拟实现，不需要实际操作
-      return {};
-
-    default:
-      console.warn(`[RelayConnection] 未实现的浏览器命令: ${method}`);
-      return {};
   }
-}
-
-/**
- * 处理 Debugger 事件
- */
-function handleDebuggerEvent(
-  source: chrome.debugger.Debuggee,
-  method: string,
-  params?: unknown
-): void {
-  if (!source.tabId) return;
-
-  const targetId = attachedTabs.get(source.tabId);
-  if (!targetId) return;
-
-  // 转发 CDP 事件到 Bridge Server
-  sendMessage({
-    method,
-    params,
-    __targetId: targetId,
-  });
+  
+  attachedTabs.clear();
 }
 
 // ==================== 连接管理 ====================
@@ -555,52 +434,61 @@ export async function connect(): Promise<void> {
       ws = new WebSocket(wsUrl);
 
       ws.onopen = async () => {
-        console.log('[RelayConnection] WebSocket 已连接');
+        debugLog('WebSocket 已连接');
 
         try {
           // 如果配置了 Token，发送认证
           if (config.token) {
-            const authId = ++internalRequestId;
+            debugLog('发送认证...');
             
-            const authPromise = new Promise<{ success: boolean }>((res, rej) => {
-              pendingInternalRequests.set(authId, {
-                resolve: res as (value: unknown) => void,
-                reject: rej,
-              });
+            const authPromise = new Promise<void>((res, rej) => {
+              const currentWs = ws!;
+            const authHandler = (event: MessageEvent) => {
+                try {
+                  const response = JSON.parse(event.data);
+                  if (response.result?.success) {
+                    currentWs.removeEventListener('message', authHandler);
+                    res();
+                  } else if (response.error) {
+                    currentWs.removeEventListener('message', authHandler);
+                    rej(new Error(response.error));
+                  }
+                } catch (e) {
+                  // 忽略解析错误，等待正确的响应
+                }
+              };
+              
+              currentWs.addEventListener('message', authHandler);
               
               // 认证超时
               setTimeout(() => {
-                if (pendingInternalRequests.has(authId)) {
-                  pendingInternalRequests.delete(authId);
-                  rej(new Error('认证超时'));
-                }
+                currentWs.removeEventListener('message', authHandler);
+                rej(new Error('认证超时'));
               }, 10000);
             });
 
-            sendMessage({
-              id: authId,
+            ws!.send(JSON.stringify({
+              id: 1,
               action: 'auth',
               token: config.token,
-            });
+            }));
 
             await authPromise;
+            debugLog('认证成功');
           }
 
           reconnectAttempts = 0;
           setConnectionState('connected');
 
-          // 设置 CDP 事件监听
-          chrome.debugger.onEvent.addListener(handleDebuggerEvent);
-          chrome.debugger.onDetach.addListener((source, reason) => {
-            if (source.tabId) {
-              const targetId = attachedTabs.get(source.tabId);
-              if (targetId) {
-                attachedTabs.delete(source.tabId);
-                targetToTab.delete(targetId);
-              }
-              console.log('[CDP] Tab 已分离:', source.tabId, reason);
-            }
-          });
+          // 设置 Debugger 事件监听
+          setupDebuggerListeners();
+
+          // 设置正常消息处理
+          const currentWs2 = ws!;
+          currentWs2.onmessage = (event) => {
+            debugLog('收到消息, 长度:', (event.data as string).length);
+            handleMessage(event.data as string);
+          };
 
           resolve();
         } catch (error) {
@@ -610,18 +498,13 @@ export async function connect(): Promise<void> {
         }
       };
 
-      ws.onmessage = (event) => {
-        console.log('[RelayConnection] WebSocket onmessage 触发, 数据长度:', (event.data as string).length);
-        handleMessage(event.data as string);
-      };
-
       ws.onclose = (event) => {
-        console.log('[RelayConnection] WebSocket 已关闭:', event.code, event.reason);
+        debugLog('WebSocket 已关闭:', event.code, event.reason);
         handleDisconnect(config.autoReconnect);
       };
 
       ws.onerror = (error) => {
-        console.error('[RelayConnection] WebSocket 错误:', error);
+        debugLog('WebSocket 错误:', error);
         if (connectionState === 'connecting') {
           setConnectionState('error');
           reject(new Error('连接失败'));
@@ -643,11 +526,11 @@ export async function disconnect(): Promise<void> {
     reconnectTimer = null;
   }
 
+  // 移除事件监听
+  removeDebuggerListeners();
+
   // 分离所有 Tab
   await detachAllTabs();
-
-  // 移除事件监听
-  chrome.debugger.onEvent.removeListener(handleDebuggerEvent);
 
   if (ws) {
     ws.close();
@@ -664,6 +547,12 @@ export async function disconnect(): Promise<void> {
 async function handleDisconnect(autoReconnect: boolean): Promise<void> {
   ws = null;
 
+  // 移除事件监听
+  removeDebuggerListeners();
+
+  // 清理已附加的 Tab（不主动分离，因为连接已断开）
+  attachedTabs.clear();
+
   if (autoReconnect && connectionState !== 'disconnected') {
     setConnectionState('error');
     scheduleReconnect();
@@ -679,7 +568,7 @@ async function scheduleReconnect(): Promise<void> {
   const config = await getConfig();
 
   if (reconnectAttempts >= config.maxReconnectAttempts) {
-    console.log('[RelayConnection] 达到最大重连次数');
+    debugLog('达到最大重连次数');
     setConnectionState('disconnected');
     return;
   }
@@ -687,13 +576,13 @@ async function scheduleReconnect(): Promise<void> {
   reconnectAttempts++;
   const delay = Math.min(config.reconnectInterval * reconnectAttempts, 30000);
 
-  console.log(`[RelayConnection] ${delay}ms 后尝试重连 (${reconnectAttempts}/${config.maxReconnectAttempts})`);
+  debugLog(`${delay}ms 后尝试重连 (${reconnectAttempts}/${config.maxReconnectAttempts})`);
 
   reconnectTimer = setTimeout(async () => {
     try {
       await connect();
     } catch (error) {
-      console.error('[RelayConnection] 重连失败:', error);
+      debugLog('重连失败:', error);
     }
   }, delay);
 }
@@ -715,12 +604,12 @@ export function initRelayConnection(): void {
       oldConfig.token !== newConfig.token
     ) {
       if (connectionState === 'connected') {
-        console.log('[RelayConnection] 配置已变化，重新连接');
+        debugLog('配置已变化，重新连接');
         await disconnect();
         try {
           await connect();
         } catch (error) {
-          console.error('[RelayConnection] 重新连接失败:', error);
+          debugLog('重新连接失败:', error);
         }
       }
     }
@@ -728,14 +617,12 @@ export function initRelayConnection(): void {
 
   // 监听 Tab 关闭
   chrome.tabs.onRemoved.addListener((tabId) => {
-    const targetId = attachedTabs.get(tabId);
-    if (targetId) {
+    if (attachedTabs.has(tabId)) {
       attachedTabs.delete(tabId);
-      targetToTab.delete(targetId);
     }
   });
 
-  console.log('[RelayConnection] 连接管理器已初始化');
+  debugLog('连接管理器已初始化');
 }
 
 /**
@@ -752,9 +639,9 @@ export function getConnectionInfo() {
 /**
  * 获取已附加的 Tab 列表
  */
-export function getAttachedTabs(): Array<{ tabId: number; targetId: string }> {
-  return Array.from(attachedTabs.entries()).map(([tabId, targetId]) => ({
+export function getAttachedTabs(): Array<{ tabId: number; targetInfo: any }> {
+  return Array.from(attachedTabs.entries()).map(([tabId, targetInfo]) => ({
     tabId,
-    targetId,
+    targetInfo,
   }));
 }
