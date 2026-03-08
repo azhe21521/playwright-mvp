@@ -3,6 +3,8 @@
  * 管理与 CDP Bridge Server 的 WebSocket 连接
  * 直接转发标准 CDP 消息
  */
+console.log('[RelayConnection] 模块加载 - 版本 2026-03-08-v2');
+
 import { type ConnectionState } from '@playwright-mvp/shared';
 import { getConfig, onConfigChange } from '../storage/config-storage.js';
 import { updateWhitelist, checkNavigationAllowed } from './whitelist.js';
@@ -160,6 +162,8 @@ async function detachAllTabs(): Promise<void> {
  * 处理来自 Bridge Server 的消息
  */
 async function handleMessage(data: string): Promise<void> {
+  console.log('[RelayConnection] 收到消息:', data.substring(0, 200));
+  
   let message: Record<string, unknown>;
   try {
     message = JSON.parse(data);
@@ -170,11 +174,15 @@ async function handleMessage(data: string): Promise<void> {
 
   const id = message.id as number | undefined;
   const action = message.action as string | undefined;
+  const method = message.method as string | undefined;
   const clientId = message.__clientId as string | undefined;
   const targetId = message.__targetId as string | undefined;
 
+  console.log(`[RelayConnection] 解析消息: id=${id}, action=${action}, method=${method}, clientId=${clientId}, targetId=${targetId}`);
+
   // 处理内部请求响应（如认证）
   if (id && pendingInternalRequests.has(id)) {
+    console.log('[RelayConnection] 处理内部请求响应');
     const pending = pendingInternalRequests.get(id)!;
     pendingInternalRequests.delete(id);
     
@@ -188,15 +196,19 @@ async function handleMessage(data: string): Promise<void> {
 
   // 处理 Bridge Server 的控制命令
   if (action) {
+    console.log('[RelayConnection] 处理控制命令:', action);
     await handleControlAction(id, action, message);
     return;
   }
 
   // 处理 CDP 命令（来自 MCP 客户端）
-  if (id && message.method) {
+  if (id && method) {
+    console.log('[RelayConnection] 处理 CDP 命令:', method);
     await handleCdpCommand(id, message, clientId, targetId);
     return;
   }
+
+  console.warn('[RelayConnection] 未处理的消息:', message);
 }
 
 /**
@@ -284,7 +296,21 @@ async function handleCdpCommand(
   const method = message.method as string;
   const params = message.params as Record<string, unknown> | undefined;
 
+  console.log(`[RelayConnection] 处理 CDP 命令: method=${method}, targetId=${targetId}`);
+
   try {
+    // 处理浏览器级别的命令（不需要 Tab）
+    if (method.startsWith('Browser.') || method.startsWith('Target.')) {
+      const result = await handleBrowserLevelCommand(method, params);
+      sendMessage({
+        id,
+        result: result ?? {},
+        __clientId: clientId,
+        __targetId: targetId,
+      });
+      return;
+    }
+
     // 确定目标 Tab
     let tabId: number;
     
@@ -331,6 +357,7 @@ async function handleCdpCommand(
       __targetId: targetId,
     });
   } catch (error) {
+    console.error(`[RelayConnection] CDP 命令执行失败: ${method}`, error);
     sendMessage({
       id,
       error: {
@@ -340,6 +367,106 @@ async function handleCdpCommand(
       __clientId: clientId,
       __targetId: targetId,
     });
+  }
+}
+
+/**
+ * 处理浏览器级别的 CDP 命令
+ * Chrome 扩展的 debugger API 不支持浏览器级别命令，需要模拟实现
+ */
+async function handleBrowserLevelCommand(
+  method: string,
+  params?: Record<string, unknown>
+): Promise<unknown> {
+  console.log(`[RelayConnection] 处理浏览器级别命令: ${method}`);
+  
+  switch (method) {
+    case 'Browser.getVersion':
+      return {
+        protocolVersion: '1.3',
+        product: 'Chrome/' + navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || 'Unknown',
+        revision: 'Unknown',
+        userAgent: navigator.userAgent,
+        jsVersion: 'Unknown',
+      };
+
+    case 'Browser.getWindowForTarget':
+      return {
+        windowId: 1,
+        bounds: { left: 0, top: 0, width: 1920, height: 1080, windowState: 'normal' },
+      };
+
+    case 'Target.getTargets':
+    case 'Target.getTargetInfo': {
+      const tabs = await chrome.tabs.query({});
+      const targets = tabs.map((tab) => ({
+        targetId: String(tab.id),
+        type: 'page',
+        title: tab.title ?? '',
+        url: tab.url ?? '',
+        attached: attachedTabs.has(tab.id!),
+        browserContextId: '1',
+      }));
+      return method === 'Target.getTargets' ? { targetInfos: targets } : { targetInfo: targets[0] };
+    }
+
+    case 'Target.createTarget': {
+      const url = (params?.url as string) || 'about:blank';
+      
+      // 检查白名单
+      if (url !== 'about:blank') {
+        const check = checkNavigationAllowed(url);
+        if (!check.allowed) {
+          throw new Error(check.reason);
+        }
+      }
+      
+      const tab = await chrome.tabs.create({ url });
+      return { targetId: String(tab.id) };
+    }
+
+    case 'Target.closeTarget': {
+      const targetId = params?.targetId as string;
+      if (targetId) {
+        await chrome.tabs.remove(parseInt(targetId, 10));
+      }
+      return { success: true };
+    }
+
+    case 'Target.activateTarget': {
+      const targetId = params?.targetId as string;
+      if (targetId) {
+        await chrome.tabs.update(parseInt(targetId, 10), { active: true });
+      }
+      return {};
+    }
+
+    case 'Target.attachToTarget': {
+      const targetId = params?.targetId as string;
+      if (targetId) {
+        const tabId = parseInt(targetId, 10);
+        await attachToTab(tabId);
+        return { sessionId: `session-${targetId}` };
+      }
+      throw new Error('Missing targetId');
+    }
+
+    case 'Target.detachFromTarget': {
+      const targetId = params?.targetId as string;
+      if (targetId) {
+        const tabId = parseInt(targetId, 10);
+        await detachFromTab(tabId);
+      }
+      return {};
+    }
+
+    case 'Target.setDiscoverTargets':
+      // 模拟实现，不需要实际操作
+      return {};
+
+    default:
+      console.warn(`[RelayConnection] 未实现的浏览器命令: ${method}`);
+      return {};
   }
 }
 
@@ -449,6 +576,7 @@ export async function connect(): Promise<void> {
       };
 
       ws.onmessage = (event) => {
+        console.log('[RelayConnection] WebSocket onmessage 触发, 数据长度:', (event.data as string).length);
         handleMessage(event.data as string);
       };
 

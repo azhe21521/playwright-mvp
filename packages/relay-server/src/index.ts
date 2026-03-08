@@ -74,10 +74,13 @@ app.get('/json/version', (req, res) => {
  * GET /json/list 或 /json - 可调试目标列表
  */
 app.get(['/json/list', '/json'], async (req, res) => {
+  logger.info(`收到 /json/list 请求`);
   try {
     const targets = await getTargetList(req.headers.host as string);
+    logger.info(`返回 targets: ${JSON.stringify(targets)}`);
     res.json(targets);
   } catch (error) {
+    logger.error(`获取 targets 失败: ${error}`);
     res.json([]);
   }
 });
@@ -156,12 +159,17 @@ app.get('/health', (req, res) => {
  * 获取 Target 列表
  */
 async function getTargetList(host: string): Promise<Target[]> {
+  logger.info(`getTargetList 被调用, extensionWs=${!!extensionWs}, readyState=${extensionWs?.readyState}`);
+  
   if (!extensionWs) {
+    logger.warn('Extension 未连接，返回空列表');
     return [];
   }
 
   try {
+    logger.info('向 Extension 发送 listTargets 请求...');
     const result = await sendToExtension({ action: 'listTargets' });
+    logger.info(`Extension 返回结果: ${JSON.stringify(result)}`);
     const tabs = result as Array<{ id: string; title: string; url: string }>;
     
     cachedTargets = tabs.map(tab => ({
@@ -210,7 +218,10 @@ function sendToExtension(message: object): Promise<unknown> {
  * 转发 CDP 命令到 Extension
  */
 function forwardCdpToExtension(clientId: string, targetId: string, message: object): void {
+  logger.info(`转发 CDP 命令: clientId=${clientId}, targetId=${targetId}, message=${JSON.stringify(message)}`);
+  
   if (!extensionWs || extensionWs.readyState !== WebSocket.OPEN) {
+    logger.warn(`Extension 未连接或连接已关闭: ws=${!!extensionWs}, readyState=${extensionWs?.readyState}`);
     const cdpClient = cdpClients.get(clientId);
     if (cdpClient) {
       const msg = message as { id?: number };
@@ -229,7 +240,17 @@ function forwardCdpToExtension(clientId: string, targetId: string, message: obje
     __targetId: targetId,
   };
 
-  extensionWs.send(JSON.stringify(forwardMessage));
+  const messageStr = JSON.stringify(forwardMessage);
+  logger.info(`发送到 Extension: ${messageStr}`);
+  logger.info(`Extension WebSocket 状态: readyState=${extensionWs.readyState}, bufferedAmount=${extensionWs.bufferedAmount}`);
+  
+  extensionWs.send(messageStr, (err) => {
+    if (err) {
+      logger.error(`发送到 Extension 失败: ${err.message}`);
+    } else {
+      logger.info(`发送到 Extension 成功`);
+    }
+  });
 }
 
 // ==================== WebSocket 服务器 ====================
@@ -322,6 +343,7 @@ function handleExtensionConnection(ws: WebSocket): void {
  */
 function setupExtensionHandlers(ws: WebSocket): void {
   ws.on('message', (data) => {
+    logger.info(`收到 Extension 消息: ${data.toString().substring(0, 200)}`);
     try {
       const message = JSON.parse(data.toString());
       handleExtensionMessage(message);
@@ -330,8 +352,8 @@ function setupExtensionHandlers(ws: WebSocket): void {
     }
   });
 
-  ws.on('close', () => {
-    logger.info('Extension 断开连接');
+  ws.on('close', (code, reason) => {
+    logger.info(`Extension 断开连接: code=${code}, reason=${reason?.toString() || 'none'}`);
     extensionWs = null;
     
     // 通知所有 CDP 客户端
@@ -342,6 +364,24 @@ function setupExtensionHandlers(ws: WebSocket): void {
 
   ws.on('error', (error) => {
     logger.error('Extension WebSocket 错误:', error);
+  });
+
+  // 设置 ping-pong 保活
+  ws.on('pong', () => {
+    logger.debug('收到 Extension pong');
+  });
+
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+      logger.debug('发送 ping 到 Extension');
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 10000);
+
+  ws.on('close', () => {
+    clearInterval(pingInterval);
   });
 }
 
@@ -409,20 +449,21 @@ function handleCdpClientConnection(ws: WebSocket, targetId: string): void {
   const clientId = randomUUID();
   cdpClients.set(clientId, ws);
   
-  logger.info(`CDP 客户端已连接: ${clientId}, target: ${targetId}`);
+  logger.info(`CDP 客户端已连接: ${clientId}, target: ${targetId}, readyState: ${ws.readyState}`);
 
   ws.on('message', (data) => {
+    logger.info(`收到 CDP 消息 [${clientId}]: ${data.toString().substring(0, 200)}`);
     try {
       const message = JSON.parse(data.toString());
-      logger.debug(`CDP 请求 [${clientId}]: ${message.method}`);
+      logger.info(`CDP 请求 [${clientId}]: method=${message.method}, id=${message.id}`);
       forwardCdpToExtension(clientId, targetId, message);
     } catch (error) {
       logger.error('CDP 消息解析失败:', error);
     }
   });
 
-  ws.on('close', () => {
-    logger.info(`CDP 客户端断开: ${clientId}`);
+  ws.on('close', (code, reason) => {
+    logger.info(`CDP 客户端断开: ${clientId}, code=${code}, reason=${reason?.toString() || 'none'}`);
     cdpClients.delete(clientId);
   });
 
