@@ -1,0 +1,29 @@
+{
+  "name": "playwright-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright MCP 中转服务和 Chrome 扩展插件，打通远程开发机与本地调试机的通信限制",
+  "scripts": {
+    "dev:bridge": "pnpm --filter @playwright-mvp/relay-server dev",
+    "dev:extension": "pnpm --filter @playwright-mvp/extension dev",
+    "build": "pnpm -r build",
+    "build:bridge": "pnpm --filter @playwright-mvp/relay-server build",
+    "build:extension": "pnpm --filter @playwright-mvp/extension build",
+    "start:bridge": "pnpm --filter @playwright-mvp/relay-server start",
+    "lint": "pnpm -r lint",
+    "clean": "pnpm -r clean"
+  },
+  "keywords": [
+    "playwright",
+    "mcp",
+    "chrome-extension",
+    "relay-server",
+    "remote-debugging"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  }
+}

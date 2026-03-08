@@ -1,0 +1,32 @@
+{
+  "name": "@playwright-mvp/extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright MVP Chrome 扩展插件",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@playwright-mvp/shared": "workspace:*",
+    "vue": "^3.4.15",
+    "zod": "^3.22.4",
+    "tdesign-vue-next": "^1.13.1",
+    "tdesign-icons-vue-next": "^0.3.6"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.260",
+    "@vitejs/plugin-vue": "^5.0.3",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.11",
+    "vue-tsc": "^2.0.0",
+    "tailwindcss": "3.4.17",
+    "tailwind-merge": "^2.5.5",
+    "tailwindcss-animate": "^1.0.7",
+    "postcss": "^8.5.0",
+    "autoprefixer": "^10.4.20"
+  }
+}

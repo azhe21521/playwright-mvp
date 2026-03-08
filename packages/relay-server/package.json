@@ -1,0 +1,32 @@
+{
+  "name": "@playwright-mvp/relay-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright MVP CDP Bridge Server",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "playwright-mvp-bridge": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli.ts",
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "cli": "tsx src/cli.ts",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@playwright-mvp/shared": "workspace:*",
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "dotenv": "^16.3.1",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/ws": "^8.5.10",
+    "@types/node": "^20.10.6",
+    "typescript": "^5.3.3",
+    "tsx": "^4.7.0"
+  }
+}

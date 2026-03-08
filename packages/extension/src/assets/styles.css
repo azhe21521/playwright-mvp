@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 自定义基础样式 */
+@layer base {
+  body {
+    @apply bg-white text-content font-sans;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  * {
+    @apply border-gray-200;
+  }
+}
+
+/* 自定义组件样式 */
+@layer components {
+  /* 状态指示器动画 */
+  .status-dot {
+    @apply relative;
+  }
+  
+  .status-dot::after {
+    content: '';
+    @apply absolute inset-0 rounded-full animate-ping opacity-75;
+  }
+  
+  .status-dot.connected::after {
+    @apply bg-green-500;
+  }
+  
+  .status-dot.connecting::after {
+    @apply bg-yellow-500;
+  }
+
+  /* 卡片悬停效果 */
+  .hover-card {
+    @apply transition-all duration-200 hover:shadow-md hover:-translate-y-0.5;
+  }
+
+  /* 渐变背景 */
+  .gradient-primary {
+    @apply bg-gradient-to-r from-primary to-primary-light;
+  }
+
+  /* 玻璃态效果 */
+  .glass {
+    @apply bg-white/80 backdrop-blur-sm;
+  }
+}
+
+/* 滚动条样式 */
+::-webkit-scrollbar {
+  @apply w-1.5 h-1.5;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-400;
+}
+
+/* TDesign 样式覆盖 */
+.t-button--primary {
+  @apply bg-primary hover:bg-primary-light;
+}
+
+.t-input {
+  @apply rounded-lg;
+}
+
+.t-tag {
+  @apply rounded-md;
+}
