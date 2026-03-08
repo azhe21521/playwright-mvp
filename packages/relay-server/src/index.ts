@@ -417,7 +417,11 @@ function handleExtensionMessage(message: Record<string, unknown>): void {
       delete cleanMessage.__clientId;
       delete cleanMessage.__targetId;
       
-      cdpClient.send(JSON.stringify(cleanMessage));
+      const msgStr = JSON.stringify(cleanMessage);
+      logger.info(`转发响应到 CDP 客户端 [${clientId}]: ${msgStr.substring(0, 150)}`);
+      cdpClient.send(msgStr);
+    } else {
+      logger.warn(`CDP 客户端 [${clientId}] 不存在或已断开`);
     }
     return;
   }

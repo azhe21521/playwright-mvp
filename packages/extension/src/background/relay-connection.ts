@@ -427,7 +427,37 @@ async function handleBrowserLevelCommand(
       }
       
       const tab = await chrome.tabs.create({ url });
-      return { targetId: String(tab.id) };
+      const targetId = String(tab.id);
+      
+      // 自动附加到新创建的 Tab（模拟 autoAttach 行为）
+      try {
+        await attachToTab(tab.id!);
+        
+        // 发送 Target.attachedToTarget 事件（Playwright 期望这个事件）
+        // 使用 setTimeout 确保在响应之后发送
+        setTimeout(() => {
+          sendMessage({
+            method: 'Target.attachedToTarget',
+            params: {
+              sessionId: targetId,
+              targetInfo: {
+                targetId: targetId,
+                type: 'page',
+                title: tab.title || '',
+                url: tab.url || url,
+                attached: true,
+                browserContextId: '1',
+              },
+              waitingForDebugger: false,
+            },
+          });
+          console.log(`[RelayConnection] 发送 Target.attachedToTarget 事件: ${targetId}`);
+        }, 50);
+      } catch (e) {
+        console.warn(`[RelayConnection] 自动附加失败: ${e}`);
+      }
+      
+      return { targetId };
     }
 
     case 'Target.closeTarget': {
