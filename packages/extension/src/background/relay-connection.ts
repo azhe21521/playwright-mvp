@@ -73,8 +73,13 @@ function setConnectionState(state: ConnectionState): void {
  * 发送消息到 Bridge Server
  */
 function sendMessage(message: unknown): void {
+  const msgStr = JSON.stringify(message);
+  console.log(`[RelayConnection] 发送消息: ${msgStr.substring(0, 200)}`);
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
+    ws.send(msgStr);
+    console.log('[RelayConnection] 消息已发送');
+  } else {
+    console.error(`[RelayConnection] WebSocket 未连接，无法发送消息: readyState=${ws?.readyState}`);
   }
 }
 
