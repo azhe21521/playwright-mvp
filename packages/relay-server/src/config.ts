@@ -49,7 +49,7 @@ function getEnvNumber(key: string, defaultValue: number): number {
  * 验证日志级别
  */
 function validateLogLevel(level: string): LogLevel {
-  const validLevels: LogLevel[] = ['debug', 'info', 'warn', 'error'];
+  const validLevels: LogLevel[] = ['trace', 'debug', 'info', 'warn', 'error'];
   return validLevels.includes(level as LogLevel) ? (level as LogLevel) : 'info';
 }
 

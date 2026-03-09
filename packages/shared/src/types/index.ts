@@ -54,10 +54,15 @@ export interface SessionInfo {
 }
 
 /** 日志级别 */
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 /** 日志配置 */
 export interface LogConfig {
   level: LogLevel;
   prefix: string;
+}
+
+/** 扩展日志配置（包含文件日志选项） */
+export interface ExtendedLogConfig extends LogConfig {
+  enableFileLog?: boolean;
 }
